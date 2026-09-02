@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+# spond: read a Spond account, for the bar widget to call.
+#
+# Everything that talks to Spond is in here, so the QML never holds a
+# credential and every answer arrives as one already-shaped JSON object.
+#
+# Spond publishes no API. This is the one its own apps use, which means two
+# things worth knowing before changing anything here. It can move without
+# notice, so every field is read defensively and a missing one degrades the
+# display rather than breaking it. And it authenticates with an email and a
+# password -- no OAuth, no scopes, no refresh token -- so a token that expires
+# can only be replaced by signing in again from the stored password. That
+# password is the whole account, so:
+#
+#   * it goes in the login keyring when one is running, and in a 0600 file
+#     under ~/.config/omarchy-spond when one is not;
+#   * it never appears in argv, because /proc/<pid>/cmdline is readable by
+#     anyone on the machine while /proc/<pid>/environ is not. It reaches curl
+#     through a 0600 temporary file and jq through the environment;
+#   * it is never printed, not even by `status`.
+#
+# Every command prints exactly one JSON object on stdout, failures included:
+#
+#     {"ok": false, "error": "...", "hint": "..."}
+#
+# so the widget parses one shape and never has to read an exit code.
+
+set -uo pipefail
+
+readonly API="https://api.spond.com/core/v1"
+readonly LOGIN_URL="$API/auth2/login"
+readonly UA="omarchy-spond/1.0"
+
+CONFIG_DIR="${OMARCHY_SPOND_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-spond}"
+CACHE_DIR="${OMARCHY_SPOND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-spond}"
+readonly CONFIG_DIR CACHE_DIR
+readonly EMAIL_FILE="$CONFIG_DIR/email"
+readonly PASSWORD_FILE="$CONFIG_DIR/password"
+readonly TOKEN_FILE="$CONFIG_DIR/access-token"
+readonly TOKEN_EXPIRES_FILE="$CONFIG_DIR/access-token-expires"
+readonly IDENTITY_FILE="$CACHE_DIR/identity.json"
+readonly KEYRING_SERVICE="omarchy-spond"
+
+# Working out which member ids this account can answer for costs a groups/
+# fetch carrying every member of every group, which is the heaviest call this
+# script makes and the one whose answer changes least. Twice a day.
+readonly IDENTITY_MAX_AGE=43200
+
+readonly HINT_LOGIN="Run: $0 login"
+
+TOKEN=""
+LAST_STATUS=""
+LAST_BODY=""
+# Set by refresh_identity/load_identity. A global rather than a return value on
+# stdout, and this is not a style choice: fail() prints the error object and
+# exits, and both of those are swallowed inside $( ). Nothing that can fail may
+# be called in a command substitution -- the error would vanish into a variable
+# and the script would carry on with nonsense in it.
+IDENTITY=""
+
+# ------------------------------------------------------------------ plumbing
+
+# Failures are JSON too, because the widget reads stdout and nothing else. jq
+# does the escaping when it is available; when it is not, the only failure that
+# can happen is the one saying so, and its text is ours and quote-free.
+fail() {
+  local error="$1" hint="${2:-}" code="${3:-}"
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg error "$error" --arg hint "$hint" --arg code "$code" \
+      '{ok: false, error: $error, hint: $hint}
+       + (if $code == "" then {} else {code: $code} end)'
+  else
+    printf '{"ok": false, "error": "%s", "hint": "%s"}\n' "$error" "$hint"
+  fi
+  exit 1
+}
+
+require_tools() {
+  command -v curl >/dev/null 2>&1 || fail "curl is not installed" "Install curl: sudo pacman -S curl"
+  command -v jq >/dev/null 2>&1 || fail "jq is not installed" "Install jq: sudo pacman -S jq"
+}
+
+# Both trees hold credentials, so they are created private and stay private
+# even if the umask in force is generous.
+ensure_dirs() {
+  umask 077
+  mkdir -p "$CONFIG_DIR" "$CACHE_DIR" 2>/dev/null || fail "cannot create $CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" "$CACHE_DIR" 2>/dev/null
+}
+
+read_first_line() {
+  [ -r "$1" ] || return 1
+  local line
+  IFS= read -r line < "$1" || [ -n "${line:-}" ] || return 1
+  printf '%s' "$line"
+}
+
+now() { date +%s; }
+
+write_private() {
+  local file="$1" content="$2"
+  ( umask 077; printf '%s\n' "$content" > "$file" ) || return 1
+  chmod 600 "$file" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- the secret
+
+keyring_available() { command -v secret-tool >/dev/null 2>&1; }
+
+# secret-tool reads the secret from stdin when stdin is not a terminal, which
+# is the only way to hand it one without putting it on a command line. A box
+# with libsecret installed but no keyring daemon running fails here rather than
+# hanging, and the caller falls back to the file.
+keyring_store() {
+  keyring_available || return 1
+  secret-tool store --label="Omarchy Spond ($1)" \
+    service "$KEYRING_SERVICE" account "$1" >/dev/null 2>&1
+}
+
+keyring_lookup() {
+  keyring_available || return 1
+  local password
+  password=$(secret-tool lookup service "$KEYRING_SERVICE" account "$1" 2>/dev/null) || return 1
+  [ -n "$password" ] || return 1
+  printf '%s' "$password"
+}
+
+keyring_clear() {
+  keyring_available || return 0
+  secret-tool clear service "$KEYRING_SERVICE" account "$1" >/dev/null 2>&1
+}
+
+stored_email() { read_first_line "$EMAIL_FILE"; }
+
+stored_password() {
+  local email="$1" password
+  if password=$(keyring_lookup "$email"); then
+    printf '%s' "$password"
+    return 0
+  fi
+  read_first_line "$PASSWORD_FILE"
+}
+
+# ------------------------------------------------------------------ requests
+
+# The body and the status code come back separately: the body can be anything,
+# including nothing, so the code goes on a line of its own at the end.
+request() {
+  local method="$1" url="$2" data_file="${3:-}"
+  local -a args=(-sS --max-time 25 -A "$UA" -H "content-type: application/json")
+  [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
+  [ -n "$data_file" ] && args+=(--data-binary "@$data_file")
+
+  local raw
+  raw=$(curl "${args[@]}" -X "$method" -w $'\n%{http_code}' "$url" 2>/dev/null)
+  if [ -z "$raw" ]; then
+    LAST_STATUS="000"
+    LAST_BODY=""
+    return 1
+  fi
+  LAST_STATUS="${raw##*$'\n'}"
+  LAST_BODY="${raw%$'\n'*}"
+  return 0
+}
+
+# Sign in with the password in SPOND_PASSWORD and cache the token it returns.
+do_login() {
+  local email="$1" tmp token expiration expires message
+  tmp=$(mktemp "${TMPDIR:-/tmp}/spond.XXXXXX") || fail "cannot create a temporary file"
+  chmod 600 "$tmp"
+  jq -n --arg email "$email" '{email: $email, password: env.SPOND_PASSWORD}' > "$tmp"
+
+  TOKEN=""
+  request POST "$LOGIN_URL" "$tmp"
+  local rc=$?
+  rm -f "$tmp"
+  [ $rc -eq 0 ] || fail "Spond did not answer" "Check the network connection"
+
+  token=$(printf '%s' "$LAST_BODY" | jq -r '.accessToken.token // empty' 2>/dev/null)
+  if [ -z "$token" ]; then
+    # Spond names the reason in one of several fields depending on the reason.
+    # Whatever it says, the 2FA case is worth calling out: this script cannot
+    # answer a challenge, and nothing it retries will help.
+    message=$(printf '%s' "$LAST_BODY" | jq -r '
+      [.error?, .errorKey?, .errorCode?, .message?]
+      | map(select(. != null and . != "")) | join(" ")' 2>/dev/null)
+    [ -n "$message" ] || message="HTTP $LAST_STATUS"
+    case "$message" in
+      *[Tt][Ww][Oo]_[Ff][Aa][Cc][Tt][Oo][Rr]*|*2FA*|*[Vv]erification*)
+        fail "Spond wants a second factor: $message" \
+          "This widget signs in with a password only. Turn 2FA off, or use an account that does not need it." \
+          "TWO_FACTOR" ;;
+      *)
+        fail "Spond rejected the sign-in: $message" \
+          "Check the email and password you use in the Spond app" "BAD_CREDENTIALS" ;;
+    esac
+  fi
+
+  expiration=$(printf '%s' "$LAST_BODY" | jq -r '.accessToken.expiration // empty' 2>/dev/null)
+  expires=$(date -u -d "$expiration" +%s 2>/dev/null) || expires=""
+  # An unparseable expiry is not worth failing over: assume the hour that
+  # Spond's tokens have always been good for, and let a 401 correct it.
+  [ -n "$expires" ] || expires=$(( $(now) + 3600 ))
+
+  write_private "$TOKEN_FILE" "$token" || fail "cannot write $TOKEN_FILE"
+  write_private "$TOKEN_EXPIRES_FILE" "$expires"
+  TOKEN="$token"
+}
+
+load_cached_token() {
+  local token expires
+  token=$(read_first_line "$TOKEN_FILE") || return 1
+  [ -n "$token" ] || return 1
+  expires=$(read_first_line "$TOKEN_EXPIRES_FILE") || expires=0
+  [[ "$expires" =~ ^[0-9]+$ ]] || expires=0
+  # A minute of headroom, so a token that expires mid-request does not.
+  [ "$expires" -gt "$(( $(now) + 60 ))" ] || return 1
+  TOKEN="$token"
+}
+
+ensure_token() {
+  load_cached_token && return 0
+  local email password
+  email=$(stored_email) || fail "Not signed in to Spond" "$HINT_LOGIN" "NOT_SIGNED_IN"
+  [ -n "$email" ] || fail "Not signed in to Spond" "$HINT_LOGIN" "NOT_SIGNED_IN"
+  password=$(stored_password "$email") || fail "No password stored for $email" "$HINT_LOGIN" "NOT_SIGNED_IN"
+  [ -n "$password" ] || fail "No password stored for $email" "$HINT_LOGIN" "NOT_SIGNED_IN"
+  export SPOND_PASSWORD="$password"
+  do_login "$email"
+  unset SPOND_PASSWORD
+}
+
+# GET an API path, signing in again once if the token turned out to be stale.
+# Spond expires tokens on its own schedule as well as the stated one, so a 401
+# on a token we believed in is ordinary rather than exceptional.
+api_get() {
+  local path="$1"
+  local query="${2:-}"
+  local url="$API/$path"
+  [ -n "$query" ] && url="$url?$query"
+  ensure_token
+  request GET "$url" || fail "Spond did not answer" "Check the network connection"
+  if [ "$LAST_STATUS" = "401" ] || [ "$LAST_STATUS" = "403" ]; then
+    rm -f "$TOKEN_FILE" "$TOKEN_EXPIRES_FILE"
+    TOKEN=""
+    ensure_token
+    request GET "$url" || fail "Spond did not answer" "Check the network connection"
+  fi
+  case "$LAST_STATUS" in
+    2*) return 0 ;;
+    401|403) fail "Spond refused the request" "$HINT_LOGIN" "NOT_SIGNED_IN" ;;
+    *) fail "Spond answered HTTP $LAST_STATUS for $path" "" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ identity
+
+# Which member ids I can answer for, and which groups they belong to.
+#
+# Spond files a response against a *member*, and the member is not necessarily
+# you. A parent is in the group as the guardian of a child, and it is the
+# child's member id that appears in an event's response lists -- so an account
+# that matches only on its own profile finds nothing and can say nothing about
+# any event. Three ways in, then: the member is me by profile, the member is me
+# by email (a group that hides profiles from ordinary members still shows the
+# email of the person asking), or the member is somebody I am guardian of.
+refresh_identity() {
+  local profile_body me_id name email groups_body identity
+  api_get "profile" ""
+  profile_body="$LAST_BODY"
+  me_id=$(printf '%s' "$profile_body" | jq -r '.id // empty')
+  [ -n "$me_id" ] || fail "Spond did not say who I am" "$HINT_LOGIN"
+  name=$(printf '%s' "$profile_body" | jq -r '
+    [.firstName?, .lastName?] | map(select(. != null and . != "")) | join(" ")')
+  email=$(stored_email) || email=""
+
+  api_get "groups/" ""
+  groups_body="$LAST_BODY"
+
+  identity=$(printf '%s' "$groups_body" | jq \
+    --arg me "$me_id" --arg name "$name" --arg email "$email" --argjson updated "$(now)" '
+    . as $groups
+    | def is_self: (.profile?.id? == $me)
+      or ($email != "" and ((.email? // "") | ascii_downcase) == ($email | ascii_downcase));
+    def is_ward: [(.guardians // [])[]? | .profile?.id?] | index($me) != null;
+    [ .[]? | .members[]?
+      | select(is_self or is_ward)
+      | {id: .id,
+         name: ((.firstName // "") | if . == "" then "?" else . end),
+         self: is_self} ]
+    | unique_by(.id) as $mine
+    | {
+        profileId: $me,
+        name: $name,
+        updated: $updated,
+        groups: [ $groups[]? | {id: .id, name: (.name // "")} ],
+        members: $mine,
+        memberIds: [ $mine[] | .id ]
+      }') || fail "could not read the groups Spond returned" ""
+
+  ( umask 077; printf '%s\n' "$identity" > "$IDENTITY_FILE" )
+  IDENTITY="$identity"
+}
+
+load_identity() {
+  local identity updated
+  if [ -r "$IDENTITY_FILE" ]; then
+    identity=$(cat "$IDENTITY_FILE" 2>/dev/null)
+    updated=$(printf '%s' "$identity" | jq -r '.updated // 0' 2>/dev/null)
+    [[ "$updated" =~ ^[0-9]+$ ]] || updated=0
+    if [ "$(( $(now) - updated ))" -lt "$IDENTITY_MAX_AGE" ]; then
+      IDENTITY="$identity"
+      return 0
+    fi
+  fi
+  refresh_identity
+}
+
+# ------------------------------------------------------------------ commands
+
+usage() {
+  cat <<'USAGE'
+spond -- talk to a Spond account, for the Omarchy bar widget.
+
+  spond login [--email you@example.com]   Sign in and remember the account
+  spond login --stdin                    Email and password on two stdin lines
+  spond logout                           Forget the account and the token
+  spond status                           Whether it is signed in, and as whom
+  spond groups                           The groups this account belongs to
+  spond events [--days N] [--past N] [--max N] [--group ID]
+               [--include-cancelled]
+                                         Events with your response to each.
+                                         --past also returns the last N days.
+  spond respond <eventId> yes|no [--member ID]
+                                         Accept or decline an invitation
+
+Everything prints one JSON object, failures included.
+USAGE
+}
+
+cmd_login() {
+  local email="" password="" from_stdin=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email) email="${2:-}"; shift 2 ;;
+      # Two lines on stdin, email then password. This is how the bar widget
+      # signs in: a pipe is the one channel that is neither argv (world
+      # readable through /proc) nor a file left behind on disk.
+      --stdin) from_stdin=true; shift ;;
+      *) fail "unknown option for login: $1" "" ;;
+    esac
+  done
+
+  if [ "$from_stdin" = true ]; then
+    IFS= read -r email || fail "no email on stdin" ""
+    IFS= read -r password || fail "no password on stdin" ""
+  else
+    [ -t 0 ] || fail "login needs a terminal" "Run it yourself: $0 login"
+
+    if [ -z "$email" ]; then
+      printf 'Spond email: ' >&2
+      IFS= read -r email || fail "no email given" ""
+    fi
+
+    printf 'Spond password (not shown): ' >&2
+    IFS= read -rs password || fail "no password given" ""
+    printf '\n' >&2
+  fi
+
+  [ -n "$email" ] || fail "no email given" ""
+  [ -n "$password" ] || fail "no password given" ""
+
+  export SPOND_PASSWORD="$password"
+  do_login "$email"
+  unset SPOND_PASSWORD
+
+  write_private "$EMAIL_FILE" "$email" || fail "cannot write $EMAIL_FILE"
+
+  local store="keyring"
+  if ! printf '%s' "$password" | keyring_store "$email"; then
+    write_private "$PASSWORD_FILE" "$password" || fail "cannot write $PASSWORD_FILE"
+    store="file"
+  else
+    rm -f "$PASSWORD_FILE"
+  fi
+  password=""
+
+  refresh_identity
+  jq -n --argjson identity "$IDENTITY" --arg store "$store" '{
+    ok: true,
+    signedIn: true,
+    account: $identity.name,
+    groups: ($identity.groups | length),
+    people: ($identity.members | length),
+    passwordStoredIn: $store
+  }'
+}
+
+cmd_logout() {
+  local email
+  email=$(stored_email) || email=""
+  [ -n "$email" ] && keyring_clear "$email"
+  rm -f "$EMAIL_FILE" "$PASSWORD_FILE" "$TOKEN_FILE" "$TOKEN_EXPIRES_FILE" "$IDENTITY_FILE"
+  jq -n '{ok: true, signedIn: false}'
+}
+
+cmd_status() {
+  local email expires
+  email=$(stored_email) || email=""
+  if [ -z "$email" ]; then
+    jq -n --arg hint "$HINT_LOGIN" '{ok: true, signedIn: false, hint: $hint}'
+    return 0
+  fi
+  load_identity
+  expires=$(read_first_line "$TOKEN_EXPIRES_FILE") || expires=0
+  [[ "$expires" =~ ^[0-9]+$ ]] || expires=0
+  jq -n --argjson identity "$IDENTITY" --arg email "$email" --argjson expires "$expires" '{
+    ok: true,
+    signedIn: true,
+    account: $identity.name,
+    email: $email,
+    groups: $identity.groups,
+    tokenExpires: $expires
+  }'
+}
+
+cmd_groups() {
+  refresh_identity
+  jq -n --argjson identity "$IDENTITY" '{ok: true, groups: $identity.groups}'
+}
+
+cmd_events() {
+  local days=14 past=0 max=50 group="" include_cancelled=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) days="${2:-14}"; shift 2 ;;
+      --past) past="${2:-0}"; shift 2 ;;
+      --max) max="${2:-50}"; shift 2 ;;
+      --group) group="${2:-}"; shift 2 ;;
+      --include-cancelled) include_cancelled=true; shift ;;
+      *) fail "unknown option for events: $1" "" ;;
+    esac
+  done
+  [[ "$days" =~ ^[0-9]+$ ]] || days=14
+  [[ "$past" =~ ^[0-9]+$ ]] || past=0
+  [[ "$max" =~ ^[0-9]+$ ]] || max=50
+
+  local identity body fixture="" is_fixture=false since
+  # The back edge of what gets returned. Whole days back when history was
+  # asked for; this instant when it was not, so "events" does not include one
+  # that finished this morning.
+  if [ "$past" -gt 0 ]; then
+    since=$(date -u -d "-$past days" +%Y-%m-%dT00:00:00.000Z)
+  else
+    since=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  fi
+  # A fixture stands in for the account while developing the widget, so the QML
+  # can be worked on without an account and without touching the network. The
+  # environment variable is for a one-off run; the file is for a session at the
+  # real bar, where there is no environment to set. Either way the answer is
+  # flagged as a fixture and the panel says so in its header, because data that
+  # cannot be told apart from the real thing is a trap rather than a fixture.
+  if [ -n "${OMARCHY_SPOND_FIXTURE:-}" ]; then
+    fixture="$OMARCHY_SPOND_FIXTURE"
+  elif [ -r "$CONFIG_DIR/fixture.json" ]; then
+    fixture="$CONFIG_DIR/fixture.json"
+  fi
+
+  if [ -n "$fixture" ]; then
+    [ -r "$fixture" ] || fail "fixture not readable: $fixture" ""
+    is_fixture=true
+    body=$(cat "$fixture")
+    if [ -r "$CONFIG_DIR/fixture-identity.json" ]; then
+      identity=$(cat "$CONFIG_DIR/fixture-identity.json")
+    else
+      identity=${OMARCHY_SPOND_IDENTITY:-'{"profileId":"me","name":"Fixture","members":[{"id":"me-1","name":"You","self":true}],"memberIds":["me-1"],"groups":[]}'}
+    fi
+  else
+    load_identity
+    identity="$IDENTITY"
+    local from to query
+    # Spond takes these as whole days, so the window runs midnight to midnight
+    # and the exact cut happens in the filter below. The back edge is today
+    # unless history was asked for, in which case it is N days back: a finished
+    # event is still an answer to "what did I do last week".
+    from=$(date -u -d "-$past days" +%Y-%m-%dT00:00:00.000Z)
+    to=$(date -u -d "+$days days" +%Y-%m-%dT00:00:00.000Z)
+    query="max=$max&scheduled=false&minEndTimestamp=$from&maxStartTimestamp=$to"
+    [ -n "$group" ] && query="$query&groupId=$group"
+    api_get "sponds/" "$query"
+    body="$LAST_BODY"
+  fi
+
+  printf '%s' "$body" | jq \
+    --argjson identity "$identity" \
+    --arg now "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+    --arg since "$since" \
+    --argjson includeCancelled "$include_cancelled" \
+    --argjson generated "$(now)" \
+    --argjson fixture "$is_fixture" '
+    # Where one member id sits in the response lists of an event, or null when
+    # the event has nothing to do with them. A list Spond has not sent at all
+    # and one that is empty mean the same thing here.
+    def answer($id; $r):
+      if   (($r.acceptedIds    // []) | index($id)) then "accepted"
+      elif (($r.declinedIds    // []) | index($id)) then "declined"
+      elif (($r.unansweredIds  // []) | index($id)) then "unanswered"
+      elif (($r.unconfirmedIds // []) | index($id)) then "unconfirmed"
+      elif (($r.waitinglistIds // []) | index($id)) then "waitinglist"
+      else null end;
+
+    # One answer standing for several people: the one that still needs doing
+    # wins, because that is what the bar is counting.
+    def rank($a):
+      if   $a == "unanswered"  then 0
+      elif $a == "unconfirmed" then 1
+      elif $a == "waitinglist" then 2
+      elif $a == "accepted"    then 3
+      else 4 end;
+
+    ($identity.members // []) as $mine
+    | [ (if type == "array" then .[] else empty end)
+        | . as $e
+        | [ $mine[] | . as $m | answer($m.id; $e.responses) as $a
+            | select($a != null) | {id: $m.id, name: $m.name, response: $a} ] as $members
+        | ($members | sort_by(rank(.response))) as $ranked
+        | {
+            id: ($e.id // ""),
+            heading: ($e.heading // "Spond"),
+            start: ($e.startTimestamp // ""),
+            end: ($e.endTimestamp // $e.startTimestamp // ""),
+            cancelled: ($e.cancelled // false),
+            type: ($e.type // "EVENT"),
+            place: ($e.location.feature // $e.location.address // ""),
+            group: ($e.recipients.group.name // ""),
+            # Everyone this event concerns whom I can answer for -- me, or a
+            # child I am guardian of -- each with their own answer.
+            members: $members,
+            # The single id a bare `respond` should file against: whichever of
+            # them still needs answering. Taken from the list the member is
+            # actually in rather than guessed from the group.
+            memberId: ($ranked[0].id // ""),
+            response: ($ranked[0].response //
+              # Nobody of mine is in any of its lists. Either the account knows
+              # of no members at all, or this event is simply not addressed to
+              # any of them.
+              (if ($mine | length) == 0 then "unknown" else "none" end))
+          } ]
+    | map(select($includeCancelled or (.cancelled | not)))
+    | map(select(.end >= $since or .start >= $now))
+    | sort_by(.start)
+    | {ok: true, signedIn: true, generated: $generated, fixture: $fixture,
+       account: ($identity.name // ""),
+       # Everyone this account can answer for. The widget needs the count to
+       # know whether a row has to say whose answer it is.
+       people: [ $mine[] | .name ],
+       events: .}' \
+    || fail "could not read the events Spond returned" ""
+}
+
+cmd_respond() {
+  local event="" answer="" member=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --member) member="${2:-}"; shift 2 ;;
+      *) if [ -z "$event" ]; then event="$1"; elif [ -z "$answer" ]; then answer="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$event" ] || fail "which event?" "Usage: $0 respond <eventId> yes|no"
+  local accepted
+  case "$answer" in
+    yes|y|accept|accepted|true) accepted="true" ;;
+    no|n|decline|declined|false) accepted="false" ;;
+    *) fail "answer yes or no, not '$answer'" "Usage: $0 respond <eventId> yes|no" ;;
+  esac
+
+  # Ahead of the lookup below, which runs in a pipeline where a failure would
+  # be swallowed: this makes "not signed in" say so.
+  ensure_token
+
+  # Without a member id from the widget, find the one this event invited me
+  # under by looking me up in its own response lists.
+  if [ -z "$member" ]; then
+    member=$(cmd_events --days 60 --max 100 --include-cancelled \
+      | jq -r --arg id "$event" '.events[]? | select(.id == $id) | .memberId' 2>/dev/null | head -n 1)
+  fi
+  [ -n "$member" ] || fail "no invitation to that event under this account" \
+    "Only an event you were invited to can be answered here"
+
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/spond.XXXXXX") || fail "cannot create a temporary file"
+  # Spond's own client sends these as strings rather than JSON booleans, and
+  # the endpoint is not documented anywhere that says the other form is safe.
+  jq -n --arg accepted "$accepted" '{accepted: $accepted}' > "$tmp"
+
+  request PUT "$API/sponds/$event/responses/$member" "$tmp"
+  local rc=$?
+  rm -f "$tmp"
+  [ $rc -eq 0 ] || fail "Spond did not answer" "Check the network connection"
+
+  case "$LAST_STATUS" in
+    2*) jq -n --arg accepted "$accepted" '{ok: true, response: (if $accepted == "true" then "accepted" else "declined" end)}' ;;
+    401|403) fail "Spond would not take that answer" "The event may be locked, or its deadline passed" ;;
+    *) fail "Spond answered HTTP $LAST_STATUS" "" ;;
+  esac
+}
+
+main() {
+  require_tools
+  ensure_dirs
+  local command="${1:-status}"
+  [ $# -gt 0 ] && shift
+  case "$command" in
+    login) cmd_login "$@" ;;
+    logout) cmd_logout ;;
+    status) cmd_status ;;
+    groups) cmd_groups ;;
+    events) cmd_events "$@" ;;
+    respond) cmd_respond "$@" ;;
+    -h|--help|help) usage ;;
+    *) fail "no such command: $command" "Run: $0 --help" ;;
+  esac
+}
+
+main "$@"

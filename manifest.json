@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "id": "digitaljohn.spond",
+  "name": "Spond",
+  "version": "1.0.0",
+  "author": "John Chipps-Harding",
+  "description": "Spond invitations waiting on an answer, and the week you have committed to",
+  "homepage": "https://github.com/digitaljohn/omarchy-spond",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "SpondWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Spond",
+    "description": "Spond invitations waiting on an answer, and the week you have committed to",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "scheduleDays": 7,
+      "requestDays": 30,
+      "pollMinutes": 15,
+      "groupId": "",
+      "panelWidth": 360,
+      "barStyle": "Requests, then next",
+      "barIcon": "",
+      "showLocation": true,
+      "hideWhenIdle": false,
+      "webUrl": "https://spond.com/client",
+      "historyDays": 7
+    },
+    "schema": [
+      {
+        "key": "scheduleDays",
+        "type": "integer",
+        "label": "Show a schedule for the next",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 7,
+        "description": "Days. Seven is a week of fixtures, which is the horizon most people actually plan against. Longer turns the panel into a season list and puts the requests further from the top."
+      },
+      {
+        "key": "requestDays",
+        "type": "integer",
+        "label": "Look for unanswered invitations up to",
+        "min": 1,
+        "max": 180,
+        "step": 1,
+        "defaultValue": 30,
+        "description": "Days ahead. Wider than the schedule on purpose: a cup match six weeks out still wants an answer this week, and an invitation you cannot see is one you will forget to answer."
+      },
+      {
+        "key": "historyDays",
+        "type": "integer",
+        "label": "Show what you did over the last",
+        "min": 0,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 7,
+        "description": "Days. The panel's bottom section: finished events and what you answered to each. Zero turns the section off and stops the widget asking Spond for the past at all."
+      },
+      {
+        "key": "pollMinutes",
+        "type": "integer",
+        "label": "Ask Spond every",
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 15,
+        "description": "Minutes. Invitations arrive on somebody else's schedule and nothing here is urgent to the minute, so this is deliberately unhurried; opening the panel always fetches fresh regardless."
+      },
+      {
+        "key": "groupId",
+        "type": "string",
+        "label": "Only this group",
+        "defaultValue": "",
+        "description": "A Spond group id, from `bin/spond groups`. Empty means every group the account belongs to, which is what you want unless one busy group is drowning out the rest."
+      },
+      {
+        "key": "barStyle",
+        "type": "enum",
+        "label": "In the bar",
+        "options": [
+          "Requests, then next",
+          "Next commitment",
+          "Icon only"
+        ],
+        "defaultValue": "Requests, then next",
+        "description": "The default shows how many invitations are waiting on you, falling back to the time of today's next commitment when none are. 'Next commitment' always names the next thing instead, which is wider and moves the bar around it more."
+      },
+      {
+        "key": "barIcon",
+        "type": "string",
+        "label": "Bar icon",
+        "defaultValue": "",
+        "description": "The glyph in front of the count. A football by default -- the one glyph in this font family that reads as sport without picking a sport. Change it if your bar font draws it as a box, or empty it for text alone."
+      },
+      {
+        "key": "panelWidth",
+        "type": "integer",
+        "label": "Panel width",
+        "min": 260,
+        "max": 720,
+        "step": 20,
+        "defaultValue": 360,
+        "description": "In the shell's spacing units. Wide enough for a heading and a place on one line; anything wider than the screen is trimmed to fit."
+      },
+      {
+        "key": "showLocation",
+        "type": "boolean",
+        "label": "Show where",
+        "defaultValue": true,
+        "description": "Puts the pitch or venue beside each event. Off if your groups all play in the same place and the name is just repetition."
+      },
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide when there is nothing on",
+        "defaultValue": false,
+        "description": "Takes the widget out of the bar entirely when nothing is waiting and nothing is coming up. Off by default: a bar item that comes and goes shifts everything beside it, and a quiet icon is usually the lesser annoyance."
+      },
+      {
+        "key": "webUrl",
+        "type": "string",
+        "label": "Where 'Open Spond' goes",
+        "defaultValue": "https://spond.com/client",
+        "description": "Opened by the panel button and by a right click on the bar. The web client's home, because Spond publishes no documented deep link to a single event."
+      }
+    ]
+  }
+}
