@@ -4,7 +4,7 @@
   "name": "Spond",
   "version": "1.0.0",
   "author": "John Chipps-Harding",
-  "description": "Spond invitations waiting on an answer, and the week you have committed to",
+  "description": "Spond invitations waiting on an answer, the week you have committed to, and what you did last week",
   "homepage": "https://github.com/digitaljohn/omarchy-spond",
   "license": "MIT",
   "kinds": [
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Spond",
-    "description": "Spond invitations waiting on an answer, and the week you have committed to",
+    "description": "Spond invitations waiting on an answer, the week you have committed to, and what you did last week",
     "category": "Info",
     "allowMultiple": false,
     "defaultSection": "right",
