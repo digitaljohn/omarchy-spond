@@ -5,6 +5,8 @@ did last week — in the Omarchy bar.
 
 ![The Spond panel](preview.png)
 
+<sub>Running on fixture data — the panel says so in its header whenever it is.</sub>
+
 The bar carries a football and the number of invitations waiting on you,
 falling back to the time of today's next commitment when nothing is waiting.
 The panel has three sections:
