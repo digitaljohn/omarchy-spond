@@ -81,9 +81,11 @@ again from the password when it expires.
 the only credential this can present; if Spond asks for a second factor, the
 panel says so and stops.
 
-Like every Omarchy plugin, this runs unsandboxed as you. It is about 600 lines
-of bash and 1,200 of QML, and both are worth a read before you trust them with
-an account.
+Like every Omarchy plugin, this runs unsandboxed as you — though it never asks
+for elevated privileges, installs nothing, and touches no file outside its own
+two directories. It talks to exactly one host, `api.spond.com`. It is about 600
+lines of bash and 1,200 of QML, and both are worth a read before you trust them
+with an account.
 
 ## Settings
 

@@ -76,8 +76,10 @@ fail() {
 }
 
 require_tools() {
-  command -v curl >/dev/null 2>&1 || fail "curl is not installed" "Install curl: sudo pacman -S curl"
-  command -v jq >/dev/null 2>&1 || fail "jq is not installed" "Install jq: sudo pacman -S jq"
+  command -v curl >/dev/null 2>&1 || fail "curl is not installed" \
+    "It ships with Omarchy; reinstall it with your package manager"
+  command -v jq >/dev/null 2>&1 || fail "jq is not installed" \
+    "It ships with Omarchy; reinstall it with your package manager"
 }
 
 # Both trees hold credentials, so they are created private and stay private
