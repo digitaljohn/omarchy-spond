@@ -70,12 +70,20 @@ where that goes:
 - to Spond over HTTPS, and nowhere else — no telemetry, no third party;
 - never into a command line, because `/proc/<pid>/cmdline` is readable by every
   process on the machine. It reaches `curl` through a private temporary file and
-  the panel's sign-in reaches the script down a pipe;
+  the panel's sign-in reaches the script down a pipe. The access token minted
+  from it gets the same treatment — it is the account until it expires, so it
+  goes to `curl` as a config file on stdin, never as a header argument;
 - never into the QML beyond the moment between the click and that pipe;
 - never into the terminal — nothing here prints it, including `status`.
 
 The access token is cached in `~/.config/omarchy-spond/access-token` and minted
 again from the password when it expires.
+
+Replies are bounded before they are read. Every request caps the response at
+8 MiB three ways — `--max-filesize` for a declared length, `ulimit -f` for a
+chunked stream that just keeps coming, and a size check before a single byte
+reaches a shell variable — so nothing on the other end of the connection gets to
+decide how much memory this allocates. Individual fields are clipped too.
 
 **Accounts with two-factor authentication cannot sign in here.** A password is
 the only credential this can present; if Spond asks for a second factor, the

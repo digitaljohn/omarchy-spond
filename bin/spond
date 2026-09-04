@@ -19,6 +19,13 @@
 #     through a 0600 temporary file and jq through the environment;
 #   * it is never printed, not even by `status`.
 #
+# The same goes for the access token minted from it. A live token is the
+# account until it expires, so it is handed to curl as a config file on stdin
+# rather than as -H on the command line, and never reaches a process listing.
+#
+# Replies are bounded before they are read: see MAX_RESPONSE_BYTES and
+# request(). Nothing this script receives is allowed to size its own allocation.
+#
 # Every command prints exactly one JSON object on stdout, failures included:
 #
 #     {"ok": false, "error": "...", "hint": "..."}
@@ -30,6 +37,14 @@ set -uo pipefail
 readonly API="https://api.spond.com/core/v1"
 readonly LOGIN_URL="$API/auth2/login"
 readonly UA="omarchy-spond/1.0"
+
+# The most one Spond response may be. The largest thing this asks for is a
+# group with every member in it -- a few hundred kilobytes -- so the cap sits
+# two orders of magnitude above the real traffic. It is not there to trim
+# Spond; it is there so that something answering on that host, having a bad day
+# or not being Spond at all, cannot make this script allocate without limit
+# before jq has seen a byte.
+readonly MAX_RESPONSE_BYTES=8388608
 
 CONFIG_DIR="${OMARCHY_SPOND_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-spond}"
 CACHE_DIR="${OMARCHY_SPOND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-spond}"
@@ -51,6 +66,10 @@ readonly HINT_LOGIN="Run: $0 login"
 TOKEN=""
 LAST_STATUS=""
 LAST_BODY=""
+# Set when a request fails for a reason worth naming, so callers can say what
+# happened instead of guessing "Spond did not answer".
+LAST_ERROR=""
+LAST_HINT=""
 # Set by refresh_identity/load_identity. A global rather than a return value on
 # stdout, and this is not a style choice: fail() prints the error object and
 # exits, and both of those are swallowed inside $( ). Nothing that can fail may
@@ -145,23 +164,69 @@ stored_password() {
 
 # ------------------------------------------------------------------ requests
 
-# The body and the status code come back separately: the body can be anything,
-# including nothing, so the code goes on a line of its own at the end.
+# One HTTP request, with the credential kept off the command line and the
+# response kept inside a known bound.
+#
+# The bearer token is not passed as -H. Everything in argv is readable by every
+# process on the machine through /proc/<pid>/cmdline, and a live token is the
+# account until it expires -- the same reason the password never goes there. It
+# is written instead into a curl config file handed over on stdin, which never
+# touches the filesystem and never appears in a process listing.
+#
+# The body goes to a file rather than into a variable, under three limits that
+# cover each other. --max-filesize refuses a response whose Content-Length is
+# over the cap, which a chunked response does not have; `ulimit -f` bounds what
+# can be written at all, so a stream that keeps coming kills curl with SIGXFSZ
+# rather than filling the disk; and the size is checked again before anything
+# is read into memory. --max-time was always there and still is.
 request() {
   local method="$1" url="$2" data_file="${3:-}"
-  local -a args=(-sS --max-time 25 -A "$UA" -H "content-type: application/json")
-  [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
+  local -a args=(-sS --max-time 25 -A "$UA" -H "content-type: application/json"
+                 --max-filesize "$MAX_RESPONSE_BYTES")
   [ -n "$data_file" ] && args+=(--data-binary "@$data_file")
 
-  local raw
-  raw=$(curl "${args[@]}" -X "$method" -w $'\n%{http_code}' "$url" 2>/dev/null)
-  if [ -z "$raw" ]; then
-    LAST_STATUS="000"
-    LAST_BODY=""
+  LAST_ERROR=""
+  LAST_HINT=""
+  local body status rc size
+  body=$(mktemp "${TMPDIR:-/tmp}/spond.XXXXXX") || {
+    LAST_STATUS="000"; LAST_BODY=""; LAST_ERROR="cannot create a temporary file"
+    return 1
+  }
+  chmod 600 "$body"
+
+  status=$(
+    (
+      ulimit -f "$(( MAX_RESPONSE_BYTES / 512 + 1 ))" 2>/dev/null
+      if [ -n "$TOKEN" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+          | curl --config - "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
+      else
+        curl "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
+      fi
+    ) 2>/dev/null
+  )
+  rc=$?
+  size=$(wc -c < "$body" 2>/dev/null) || size=0
+  rm -f "$body.tmp" 2>/dev/null
+
+  # curl exits 63 on --max-filesize; a SIGXFSZ kill from the ulimit lands here
+  # as 128+25. Either way the answer was too big to look at.
+  if [ "$rc" -eq 63 ] || [ "$rc" -eq 153 ] || [ "${size:-0}" -gt "$MAX_RESPONSE_BYTES" ]; then
+    rm -f "$body"
+    LAST_STATUS="000"; LAST_BODY=""
+    LAST_ERROR="Spond sent more than $MAX_RESPONSE_BYTES bytes for one request"
+    LAST_HINT="Refused before it was read. If this keeps happening, something on that host is not answering the way Spond does."
     return 1
   fi
-  LAST_STATUS="${raw##*$'\n'}"
-  LAST_BODY="${raw%$'\n'*}"
+  if [ "$rc" -ne 0 ] || [ -z "$status" ]; then
+    rm -f "$body"
+    LAST_STATUS="000"; LAST_BODY=""
+    return 1
+  fi
+
+  LAST_STATUS="$status"
+  LAST_BODY=$(cat "$body")
+  rm -f "$body"
   return 0
 }
 
@@ -176,7 +241,7 @@ do_login() {
   request POST "$LOGIN_URL" "$tmp"
   local rc=$?
   rm -f "$tmp"
-  [ $rc -eq 0 ] || fail "Spond did not answer" "Check the network connection"
+  [ $rc -eq 0 ] || fail "${LAST_ERROR:-Spond did not answer}" "${LAST_HINT:-Check the network connection}"
 
   token=$(printf '%s' "$LAST_BODY" | jq -r '.accessToken.token // empty' 2>/dev/null)
   if [ -z "$token" ]; then
@@ -241,12 +306,12 @@ api_get() {
   local url="$API/$path"
   [ -n "$query" ] && url="$url?$query"
   ensure_token
-  request GET "$url" || fail "Spond did not answer" "Check the network connection"
+  request GET "$url" || fail "${LAST_ERROR:-Spond did not answer}" "${LAST_HINT:-Check the network connection}"
   if [ "$LAST_STATUS" = "401" ] || [ "$LAST_STATUS" = "403" ]; then
     rm -f "$TOKEN_FILE" "$TOKEN_EXPIRES_FILE"
     TOKEN=""
     ensure_token
-    request GET "$url" || fail "Spond did not answer" "Check the network connection"
+    request GET "$url" || fail "${LAST_ERROR:-Spond did not answer}" "${LAST_HINT:-Check the network connection}"
   fi
   case "$LAST_STATUS" in
     2*) return 0 ;;
@@ -287,15 +352,15 @@ refresh_identity() {
     def is_ward: [(.guardians // [])[]? | .profile?.id?] | index($me) != null;
     [ .[]? | .members[]?
       | select(is_self or is_ward)
-      | {id: .id,
-         name: ((.firstName // "") | if . == "" then "?" else . end),
+      | {id: (.id | .[0:128]),
+         name: ((.firstName // "") | if . == "" then "?" else . end | .[0:80]),
          self: is_self} ]
     | unique_by(.id) as $mine
     | {
         profileId: $me,
         name: $name,
         updated: $updated,
-        groups: [ $groups[]? | {id: .id, name: (.name // "")} ],
+        groups: [ $groups[]? | {id: (.id | .[0:128]), name: ((.name // "") | .[0:120])} ],
         members: $mine,
         memberIds: [ $mine[] | .id ]
       }') || fail "could not read the groups Spond returned" ""
@@ -520,28 +585,32 @@ cmd_events() {
       elif $a == "accepted"    then 3
       else 4 end;
 
+    # No single string from Spond travels further than it can be read.
+    def clip($n): if type == "string" then .[0:$n] else . end;
+
     ($identity.members // []) as $mine
     | [ (if type == "array" then .[] else empty end)
         | . as $e
         | [ $mine[] | . as $m | answer($m.id; $e.responses) as $a
-            | select($a != null) | {id: $m.id, name: $m.name, response: $a} ] as $members
+            | select($a != null)
+            | {id: ($m.id | clip(128)), name: ($m.name | clip(80)), response: $a} ] as $members
         | ($members | sort_by(rank(.response))) as $ranked
         | {
-            id: ($e.id // ""),
-            heading: ($e.heading // "Spond"),
-            start: ($e.startTimestamp // ""),
-            end: ($e.endTimestamp // $e.startTimestamp // ""),
+            id: (($e.id // "") | clip(128)),
+            heading: (($e.heading // "Spond") | clip(200)),
+            start: (($e.startTimestamp // "") | clip(40)),
+            end: (($e.endTimestamp // $e.startTimestamp // "") | clip(40)),
             cancelled: ($e.cancelled // false),
             type: ($e.type // "EVENT"),
-            place: ($e.location.feature // $e.location.address // ""),
-            group: ($e.recipients.group.name // ""),
+            place: (($e.location.feature // $e.location.address // "") | clip(120)),
+            group: (($e.recipients.group.name // "") | clip(120)),
             # Everyone this event concerns whom I can answer for -- me, or a
             # child I am guardian of -- each with their own answer.
             members: $members,
             # The single id a bare `respond` should file against: whichever of
             # them still needs answering. Taken from the list the member is
             # actually in rather than guessed from the group.
-            memberId: ($ranked[0].id // ""),
+            memberId: (($ranked[0].id // "") | clip(128)),
             response: ($ranked[0].response //
               # Nobody of mine is in any of its lists. Either the account knows
               # of no members at all, or this event is simply not addressed to
@@ -555,7 +624,7 @@ cmd_events() {
        account: ($identity.name // ""),
        # Everyone this account can answer for. The widget needs the count to
        # know whether a row has to say whose answer it is.
-       people: [ $mine[] | .name ],
+       people: [ $mine[] | .name | clip(80) ],
        events: .}' \
     || fail "could not read the events Spond returned" ""
 }
@@ -598,7 +667,7 @@ cmd_respond() {
   request PUT "$API/sponds/$event/responses/$member" "$tmp"
   local rc=$?
   rm -f "$tmp"
-  [ $rc -eq 0 ] || fail "Spond did not answer" "Check the network connection"
+  [ $rc -eq 0 ] || fail "${LAST_ERROR:-Spond did not answer}" "${LAST_HINT:-Check the network connection}"
 
   case "$LAST_STATUS" in
     2*) jq -n --arg accepted "$accepted" '{ok: true, response: (if $accepted == "true" then "accepted" else "declined" end)}' ;;
