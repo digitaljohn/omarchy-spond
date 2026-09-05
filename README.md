@@ -72,12 +72,23 @@ where that goes:
   process on the machine. It reaches `curl` through a private temporary file and
   the panel's sign-in reaches the script down a pipe. The access token minted
   from it gets the same treatment — it is the account until it expires, so it
-  goes to `curl` as a config file on stdin, never as a header argument;
+  never appears as a header argument either;
 - never into the QML beyond the moment between the click and that pipe;
 - never into the terminal — nothing here prints it, including `status`.
 
 The access token is cached in `~/.config/omarchy-spond/access-token` and minted
 again from the password when it expires.
+
+The token is checked before it is stored and again when it is read back off
+disk: base64 alphabet only, 16 to 4096 characters, nothing else. It arrives from
+whatever answered the login and is cached in a file something else could edit,
+and it is handed to `curl`, whose config file is a grammar — a token carrying a
+quote and a newline could otherwise close the header value and start a directive
+of its own. On curl 8.3 and later the bytes never reach that grammar at all:
+they travel in the environment and are substituted after parsing by
+`--expand-header`. Older curl gets a config file on stdin, which only ever sees
+a token that passed the check. `test/token-injection` covers both, and fails
+loudly if the check is ever removed.
 
 Replies are bounded before they are read. Every request caps the response at
 8 MiB three ways — `--max-filesize` for a declared length, `ulimit -f` for a
@@ -160,6 +171,17 @@ the script answers out of it without touching the network.
 panel's header reads `SPOND · FIXTURE` for as long as one is in use, because
 test data that cannot be told apart from the real thing is a trap rather than a
 fixture.
+
+## Tests
+
+```bash
+test/token-injection
+```
+
+Covers the credential parser boundary: quote, newline, backslash, whitespace,
+control-character and over-length payloads, a poisoned cached token file, and
+whichever of the two `curl` transports this machine uses. No account needed for
+any of it except the last check, which skips when you are not signed in.
 
 ## The API this uses
 

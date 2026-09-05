@@ -46,6 +46,19 @@ readonly UA="omarchy-spond/1.0"
 # before jq has seen a byte.
 readonly MAX_RESPONSE_BYTES=8388608
 
+# What a token is allowed to be. Spond's is an opaque base64 string a few
+# hundred characters long; a JWT, should they ever switch, is the same alphabet
+# with dots. Nothing in that set means anything to a parser -- no quote, no
+# backslash, no whitespace, no control character, nothing that could close a
+# header value and start a new directive.
+#
+# This is checked when a token arrives and again when one is read back off
+# disk, because both are somebody else's bytes: the first comes from whatever
+# answered the login, the second from a file that something else may have
+# edited since.
+readonly TOKEN_MIN_LENGTH=16
+readonly TOKEN_MAX_LENGTH=4096
+
 CONFIG_DIR="${OMARCHY_SPOND_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-spond}"
 CACHE_DIR="${OMARCHY_SPOND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-spond}"
 readonly CONFIG_DIR CACHE_DIR
@@ -109,6 +122,17 @@ ensure_dirs() {
   chmod 700 "$CONFIG_DIR" "$CACHE_DIR" 2>/dev/null
 }
 
+# True when a string is shaped like a credential and nothing else.
+valid_token() {
+  local token="${1-}"
+  [ "${#token}" -ge "$TOKEN_MIN_LENGTH" ] || return 1
+  [ "${#token}" -le "$TOKEN_MAX_LENGTH" ] || return 1
+  case "$token" in
+    *[!A-Za-z0-9._~+/=-]*) return 1 ;;
+  esac
+  return 0
+}
+
 read_first_line() {
   [ -r "$1" ] || return 1
   local line
@@ -169,9 +193,14 @@ stored_password() {
 #
 # The bearer token is not passed as -H. Everything in argv is readable by every
 # process on the machine through /proc/<pid>/cmdline, and a live token is the
-# account until it expires -- the same reason the password never goes there. It
-# is written instead into a curl config file handed over on stdin, which never
-# touches the filesystem and never appears in a process listing.
+# account until it expires -- the same reason the password never goes there.
+#
+# Where curl can expand a variable after it has finished parsing (8.3 and
+# later), the token travels in the environment and is substituted into the
+# header by --expand-header, so its bytes are never read as configuration at
+# all. Older curl gets the same header through a config file on stdin, which
+# never touches disk and never reaches a process listing; that path is a
+# grammar, which is why nothing reaches it that has not passed valid_token.
 #
 # The body goes to a file rather than into a variable, under three limits that
 # cover each other. --max-filesize refuses a response whose Content-Length is
@@ -179,6 +208,19 @@ stored_password() {
 # can be written at all, so a stream that keeps coming kills curl with SIGXFSZ
 # rather than filling the disk; and the size is checked again before anything
 # is read into memory. --max-time was always there and still is.
+# Whether this curl can substitute a variable into a header after parsing.
+# Asked once; --help exits 0 for an option it knows and 2 for one it does not.
+curl_expands_variables() {
+  if [ -z "${CURL_EXPANDS:-}" ]; then
+    if curl --variable %X=1 --expand-header "X: {{X}}" --help >/dev/null 2>&1; then
+      CURL_EXPANDS=yes
+    else
+      CURL_EXPANDS=no
+    fi
+  fi
+  [ "$CURL_EXPANDS" = yes ]
+}
+
 request() {
   local method="$1" url="$2" data_file="${3:-}"
   local -a args=(-sS --max-time 25 -A "$UA" -H "content-type: application/json"
@@ -197,11 +239,15 @@ request() {
   status=$(
     (
       ulimit -f "$(( MAX_RESPONSE_BYTES / 512 + 1 ))" 2>/dev/null
-      if [ -n "$TOKEN" ]; then
+      if [ -z "$TOKEN" ]; then
+        curl "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
+      elif curl_expands_variables; then
+        SPOND_AUTH="$TOKEN" curl --variable %SPOND_AUTH \
+          --expand-header "Authorization: Bearer {{SPOND_AUTH}}" \
+          "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
+      else
         printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
           | curl --config - "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
-      else
-        curl "${args[@]}" -X "$method" -o "$body" -w '%{http_code}' "$url"
       fi
     ) 2>/dev/null
   )
@@ -244,6 +290,13 @@ do_login() {
   [ $rc -eq 0 ] || fail "${LAST_ERROR:-Spond did not answer}" "${LAST_HINT:-Check the network connection}"
 
   token=$(printf '%s' "$LAST_BODY" | jq -r '.accessToken.token // empty' 2>/dev/null)
+  # Before it is stored, let alone used. A token that is not shaped like one is
+  # not a token, whatever the thing on the other end of the connection says.
+  if [ -n "$token" ] && ! valid_token "$token"; then
+    fail "Spond returned a token that is not shaped like one" \
+      "Refused before it was stored. Nothing but letters, digits and base64 punctuation is accepted." \
+      "BAD_TOKEN"
+  fi
   if [ -z "$token" ]; then
     # Spond names the reason in one of several fields depending on the reason.
     # Whatever it says, the 2FA case is worth calling out: this script cannot
@@ -277,7 +330,9 @@ do_login() {
 load_cached_token() {
   local token expires
   token=$(read_first_line "$TOKEN_FILE") || return 1
-  [ -n "$token" ] || return 1
+  # The cached file is not trusted either: anything that has been edited into
+  # it is discarded and a fresh token is fetched with the stored password.
+  valid_token "$token" || { rm -f "$TOKEN_FILE" "$TOKEN_EXPIRES_FILE"; return 1; }
   expires=$(read_first_line "$TOKEN_EXPIRES_FILE") || expires=0
   [[ "$expires" =~ ^[0-9]+$ ]] || expires=0
   # A minute of headroom, so a token that expires mid-request does not.
@@ -679,6 +734,7 @@ cmd_respond() {
 main() {
   require_tools
   ensure_dirs
+  curl_expands_variables || true
   local command="${1:-status}"
   [ $# -gt 0 ] && shift
   case "$command" in
@@ -693,4 +749,6 @@ main() {
   esac
 }
 
-main "$@"
+# Sourced with OMARCHY_SPOND_LIB=1 the file defines its functions and stops,
+# so the tests can exercise them directly. Run normally, it runs.
+[ "${OMARCHY_SPOND_LIB:-}" = "1" ] || main "$@"
